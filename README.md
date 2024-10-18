@@ -1,6 +1,6 @@
-# LilyGo-EPD-4-7-OWM-Weather-Display
+# JYSporTech Weather Station
 
-Open Weather Map weather station using [LilyGo EPD 4.7" display](https://bit.ly/3exI3Hb)
+The project is based on [LilyGo EPD 4.7" display](https://bit.ly/3exI3Hb) and [Inkplate10LVGL](https://github.com/VolosR/Inkplate10LVGL/tree/main/Soldered10)
 
 [![Presetation video](assets/001.png)](https://www.youtube.com/watch?v=TQaVQcld1Pk)
 
