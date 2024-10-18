@@ -2,7 +2,7 @@
 
 The project is based on [LilyGo EPD 4.7" display](https://bit.ly/3exI3Hb) and [Inkplate10LVGL](https://github.com/VolosR/Inkplate10LVGL/tree/main/Soldered10)
 
-[![Presetation video](assets/001.png)](https://www.youtube.com/watch?v=TQaVQcld1Pk)
+I am happy to share the code, but this is completely for personal interest only and do not allow of commercial usage
 
 # License
 
