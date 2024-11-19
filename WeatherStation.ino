@@ -1,3 +1,18 @@
+/**
+ * @note      Arduino Setting
+ *            Tools ->
+ *                  Boards Manager : "esp32 by Espressif Systems -> 2.0.17"
+ *                  Board:"ESP32S3 Dev Module"
+ *                  USB CDC On Boot:"Enable"
+ *                  USB DFU On Boot:"Disable"
+ *                  Flash Size : "16MB(128Mb)"
+ *                  Flash Mode"QIO 80MHz
+ *                  Partition Scheme:"16M Flash(3M APP/9.9MB FATFS)"
+ *                  PSRAM:"OPI PSRAM"
+ *                  Upload Mode:"UART0/Hardware CDC"
+ *                  USB Mode:"Hardware CDC and JTAG"
+ *  
+ */
 #include <Arduino.h>            // In-built
 #include <esp_task_wdt.h>       // In-built
 #include "freertos/FreeRTOS.h"  // In-built
@@ -8,13 +23,15 @@
 #include <ArduinoJson.h>        // https://github.com/bblanchon/ArduinoJson
 #include <HTTPClient.h>         // In-built
 
-#include <WiFi.h>               // In-built
+#include "WiFi.h"               // In-built
+#include <WiFiClientSecure.h>
 #include <SPI.h>                // In-built
 #include <time.h>               // In-built
 
 #include "owm_credentials.h"
 #include "forecast_record.h"
 #include "lang.h"
+#include "googleTaskFromHA.h"
 
 #define SCREEN_WIDTH   EPD_WIDTH
 #define SCREEN_HEIGHT  EPD_HEIGHT
@@ -55,19 +72,20 @@ float rain_readings[max_readings]        = {0};
 float snow_readings[max_readings]        = {0};
 float agileTariff[48];
 
-long SleepDuration   = 15; // Sleep time in minutes, aligned to the nearest minute boundary, so if 30 will always update at 00 or 30 past the hour
+long SleepDuration   = 5; // Sleep time in minutes, aligned to the nearest minute boundary, so if 30 will always update at 00 or 30 past the hour
 int  WakeupHour      = 7;  // Wakeup after 07:00 to save battery power
 int  SleepHour       = 23; // Sleep  after 23:00 to save battery power
 long StartTime       = 0;
 long SleepTimer      = 0;
-long Delta           = 15; // ESP32 rtc speed compensation, prevents display at xx:59:yy and then xx:00:yy (one minute later) to save power
+long Delta           = 5; // ESP32 rtc speed compensation, prevents display at xx:59:yy and then xx:00:yy (one minute later) to save power
 
 //fonts
 #include "opensans8b.h"
 //#include "opensans10b.h"
 #include "opensans12b.h"
 #include "opensans18b.h"
-#include "opensans24b.h"
+//#include "opensans24b.h"
+#include "chinese20.h"
 
 #include "baseimg.h"
 
@@ -102,10 +120,14 @@ boolean SetupTime() {
 uint8_t StartWiFi() {
   Serial.println("\r\nConnecting to: " + String(ssid));
   IPAddress dns(8, 8, 8, 8); // Use Google DNS
+  IPAddress ip(192,168,50,86);
+  IPAddress gateway(192,168,50,1);
+  IPAddress subnet(255,255,255,0);
   WiFi.disconnect();
   WiFi.mode(WIFI_STA); // switch off AP
   WiFi.setAutoConnect(true);
   WiFi.setAutoReconnect(true);
+  WiFi.config(ip, gateway, subnet, dns);
   WiFi.begin(ssid, password);
   if (WiFi.waitForConnectResult() != WL_CONNECTED) {
     Serial.printf("STA: Failed!\n");
@@ -116,6 +138,7 @@ uint8_t StartWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     wifi_signal = WiFi.RSSI(); // Get Wifi Signal strength now, because the WiFi will be turned off to save power!
     Serial.println("WiFi connected at: " + WiFi.localIP().toString());
+    Serial.println("WiFi mac address: " + WiFi.macAddress());
   }
   else Serial.println("WiFi connection *** FAILED ***");
   return WiFi.status();
@@ -124,6 +147,7 @@ uint8_t StartWiFi() {
 void StopWiFi() {
   WiFi.disconnect();
   WiFi.mode(WIFI_OFF);
+  //esp_wifi_disconnect();
   Serial.println("WiFi switched Off");
 }
 
@@ -168,16 +192,18 @@ void setup() {
       bool RxForecast = false;
       bool RxWaterFloat = false;
       bool RxOctopusAgileRate = false;
+      bool RxGoogleTaskFromHA = false;
       WiFiClient client;   // wifi client object
-      while ((RxWeather == false || RxForecast == false) && Attempts <= 2) { // Try up-to 2 time for Weather and Forecast data
+      while ((RxWeather == false || RxForecast == false || RxWaterFloat == false) && Attempts <= 2) { // Try up-to 2 time for Weather and Forecast data
         if (RxWeather  == false) RxWeather  = obtainWeatherData(client, "weather");
         if (RxForecast == false) RxForecast = obtainWeatherData(client, "forecast");
         if (RxWaterFloat == false) RxWaterFloat = obtainWaterFloatData(client, WFStation); //get water float rate from station
         if (RxOctopusAgileRate == false) RxOctopusAgileRate = obtainOctpusAgileRate(client, agileTariffLocation);
+        if (RxGoogleTaskFromHA == false) RxGoogleTaskFromHA = getTodoItemsFromHA(client);
         Attempts++;
       }
       Serial.println("Received all weather data...");
-      if (RxWeather && RxForecast) { // Only if received both Weather or Forecast proceed
+      if (RxWeather && RxForecast ) { // Only if received both Weather or Forecast proceed
         StopWiFi();         // Reduces power consumption
         epd_poweron();      // Switch on EPD display
         epd_clear();        // Clear the screen
@@ -228,12 +254,19 @@ bool DecodeWeather(WiFiClient& json, String Type) {
     WxConditions[0].High        = -50; // Minimum forecast low
     WxConditions[0].Low         = 50;  // Maximum Forecast High
     WxConditions[0].FTimezone   = doc["timezone_offset"]; // "0"
+    //JsonObject current = doc["current"];
+    WxConditions[0].Sunrise     = doc["sys"]["sunrise"];                              Serial.println("SRis: " + String(WxConditions[0].Sunrise));
+    WxConditions[0].Sunset      = doc["sys"]["sunset"];                               Serial.println("SSet: " + String(WxConditions[0].Sunset));
     WxConditions[0].Temperature = doc["main"]["temp"];                                 Serial.println("Temp: " + String(WxConditions[0].Temperature));
     WxConditions[0].FeelsLike   = doc["main"]["feels_like"];                           Serial.println("FLik: " + String(WxConditions[0].FeelsLike));
     WxConditions[0].Pressure    = doc["main"]["pressure"];                             Serial.println("Pres: " + String(WxConditions[0].Pressure));
     WxConditions[0].Humidity    = doc["main"]["humidity"];                             Serial.println("Humi: " + String(WxConditions[0].Humidity));
     WxConditions[0].DewPoint    = doc["dew_point"];                            Serial.println("DPoi: " + String(WxConditions[0].DewPoint));
+    WxConditions[0].UVI         = doc["uvi"];                                  Serial.println("UVin: " + String(WxConditions[0].UVI));
     WxConditions[0].Cloudcover  = doc["clouds"]["all"];                               Serial.println("CCov: " + String(WxConditions[0].Cloudcover));
+    WxConditions[0].Visibility  = doc["visibility"];                           Serial.println("Visi: " + String(WxConditions[0].Visibility));
+    WxConditions[0].Windspeed   = doc["wind"]["speed"];                           Serial.println("WSpd: " + String(WxConditions[0].Windspeed));
+    WxConditions[0].Winddir     = doc["wind"]["deg"];                             Serial.println("WDir: " + String(WxConditions[0].Winddir));
     JsonObject current_weather  = doc["weather"][0];
     String Description = current_weather["description"];                           // "scattered clouds"
     String Icon        = current_weather["icon"];                                  // "01n"
@@ -250,6 +283,8 @@ bool DecodeWeather(WiFiClient& json, String Type) {
       WxForecast[r].Temperature       = list[r]["main"]["temp"].as<float>();       Serial.println("Temp: " + String(WxForecast[r].Temperature));
       WxForecast[r].Low               = list[r]["main"]["temp_min"].as<float>();   Serial.println("TLow: " + String(WxForecast[r].Low));
       WxForecast[r].High              = list[r]["main"]["temp_max"].as<float>();   Serial.println("THig: " + String(WxForecast[r].High));
+      WxForecast[r].Pressure          = list[r]["main"]["pressure"].as<float>();   Serial.println("Pres: " + String(WxForecast[r].Pressure));
+      WxForecast[r].Humidity          = list[r]["main"]["humidity"].as<float>();   Serial.println("Humi: " + String(WxForecast[r].Humidity));
       WxForecast[r].Icon              = (const char*)list[r]["weather"][0]["icon"]; Serial.println("Icon: " + String(WxForecast[r].Icon));
       WxForecast[r].Rainfall          = list[r]["rain"]["3h"].as<float>();         Serial.println("Rain: " + String(WxForecast[r].Rainfall));
       WxForecast[r].Snowfall          = list[r]["snow"]["3h"].as<float>();         Serial.println("Snow: " + String(WxForecast[r].Snowfall));
@@ -258,6 +293,13 @@ bool DecodeWeather(WiFiClient& json, String Type) {
         if (WxForecast[r].Low  < WxConditions[0].Low)  WxConditions[0].Low  = WxForecast[r].Low;  // Get Lowest  temperature for next 24Hrs
       }
     }
+    //------------------------------------------
+    float pressure_trend = WxForecast[0].Pressure - WxForecast[2].Pressure; // Measure pressure slope between ~now and later
+    pressure_trend = ((int)(pressure_trend * 10)) / 10.0; // Remove any small variations less than 0.1
+    WxConditions[0].Trend = "=";
+    if (pressure_trend > 0)  WxConditions[0].Trend = "+";
+    if (pressure_trend < 0)  WxConditions[0].Trend = "-";
+    if (pressure_trend == 0) WxConditions[0].Trend = "0";
 
     if (Units == "I") Convert_Readings_to_Imperial();
   }
@@ -303,26 +345,80 @@ bool obtainWeatherData(WiFiClient & client, const String & RequestType) {
 }
 
 //#########################################################################################
-bool obtainWaterFloatData(WiFiClient & client, String & Station) {
-  client.stop(); // close connection before sending a new request
-  Serial.println(Station);
-  
+bool obtainWaterFloatData(WiFiClient & client, String & station) {
+  WiFiClientSecure wfclient;
+  //wfclient.setInsecure();
+
+
   HTTPClient http;
   //api.openweathermap.org/data/2.5/RequestType?lat={lat}&lon={lon}&appid={API key}
   //http://environment.data.gov.uk/flood-monitoring/id/measures/3400TH-flow-water-i-15_min-m3_s
-  String uri = "http://environment.data.gov.uk/flood-monitoring/id/measures/3400TH-flow-water-i-15_min-m3_s";
-  http.begin(client, uri); //http.begin(uri,test_root_ca); //HTTPS example connection
-  int httpCode = http.GET();
-  if (httpCode == HTTP_CODE_OK) {
+  String uri;
+  uri = "https://environment.data.gov.uk/flood-monitoring/id/measures/" + station + "-flow-water-i-15_min-m3_s";
+
+  
+  const char* root_ca =\
+  "-----BEGIN CERTIFICATE-----\n" \
+  "MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh\n" \
+  "MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3\n" \
+  "d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH\n" \
+  "MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT\n" \
+  "MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j\n" \
+  "b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG\n" \
+  "9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI\n" \
+  "2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx\n" \
+  "1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ\n" \
+  "q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz\n" \
+  "tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ\n" \
+  "vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP\n" \
+  "BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV\n" \
+  "5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY\n" \
+  "1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4\n" \
+  "NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG\n" \
+  "Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91\n" \
+  "8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe\n" \
+  "pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl\n" \
+  "MrY=\n" \
+  "-----END CERTIFICATE-----\n";
+
+  wfclient.setCACert(root_ca);
+
+  http.begin(wfclient, uri); //http.begin(uri,test_root_ca); //HTTPS example connection
+  int httpResponseCode = http.GET();
+  Serial.println("FLOW HTTP Return code : "+String(httpResponseCode));
+
+  if (httpResponseCode == 301 || httpResponseCode == 302) {
+      Serial.println("Redirection occurred...");
+      String newLocation = http.getLocation();  // Get the new URL from the Location header
+      Serial.print("Redirecting to: ");
+      Serial.println(newLocation);
+      
+      // Close the current connection
+      http.end();
+      
+      // Begin a new connection with the new URL
+      http.begin(newLocation);
+      httpResponseCode = http.GET();  // Resend the GET request to the new URL
+
+      // Check for successful response
+      if (httpResponseCode > 0) {
+        String response = http.getString();  // Get response as String
+        Serial.println("Response:");
+        Serial.println(response);            // Print the response
+      } else {
+        Serial.print("Error on HTTP request: ");
+        Serial.println(httpResponseCode);    // Print error code
+        http.end();
+        return false;
+      }
+  } else if (httpResponseCode == HTTP_CODE_OK) {
     if (!DecodeWaterFloat(http.getStream())) return false;
     client.stop();
-  }
-  else
-  {
-    Serial.printf("connection failed to get water float, error: %s", http.errorToString(httpCode).c_str());
-    client.stop();
-    http.end();
-    return false;
+  } else {
+      Serial.printf("connection failed to get water float, error: %s", http.errorToString(httpResponseCode).c_str());
+      client.stop();
+      http.end();
+      return false;
   }
   http.end();
   return true;
@@ -331,7 +427,7 @@ bool obtainWaterFloatData(WiFiClient & client, String & Station) {
 bool DecodeOctpusAgileRate(WiFiClient& json) {
   int reversedIndex = 48;
   Serial.print(F("\nCreating AgileRate object...and "));
-  DynamicJsonDocument aDoc(64 * 1024);                      // allocate the JsonDocument
+  DynamicJsonDocument aDoc(96 * 1024);                      // allocate the JsonDocument
   DeserializationError error = deserializeJson(aDoc, json); // Deserialize the JSON document
   if (error) {                                             // Test if parsing succeeds.
     Serial.print(F("deserializeJson() failed: "));
@@ -341,6 +437,7 @@ bool DecodeOctpusAgileRate(WiFiClient& json) {
   JsonObject root = aDoc.as<JsonObject>();
   JsonArray results = root["results"];
 
+  //today midnight to next day midnight
   int arraySize = results.size();
   int aPointer = 0;
   int saveAt = 0;
@@ -357,27 +454,31 @@ bool DecodeOctpusAgileRate(WiFiClient& json) {
   return true;
 }
 
+
 //###########################################################################################
 bool obtainOctpusAgileRate(WiFiClient & client, String & theLocation) {
   client.stop(); // close connection before sending a new request
-  Serial.println(theLocation);
+  //Serial.println(theLocation);
 
   String newuri = "";
+  // char time_string[20];
 
-  newuri = "https://api.octopus.energy/v1/products/" + theLocation + "/electricity-tariffs/E-1R-" + theLocation + "-J/standard-unit-rates//?page_size=100&period_from=!!T00:00&period_to=!!T23:59";
+  // get_time_four_hours_ago_truncated(time_string, sizeof(time_string));
+
+  if ( CurrentHour >= 12 ) {
+    newuri = "https://api.octopus.energy/v1/products/" + theLocation + "/electricity-tariffs/E-1R-" + theLocation + "-J/standard-unit-rates/?page_size=100&period_from=!!T12:00";
+  } else {
+    newuri = "https://api.octopus.energy/v1/products/" + theLocation + "/electricity-tariffs/E-1R-" + theLocation + "-J/standard-unit-rates/?page_size=100&period_from=!!T00:00&period_to=!!T23:59";
+  }
   newuri.replace("!!",Date_str);
   Serial.println(newuri);
 
 
   HTTPClient octopusAPI;
-  //api.openweathermap.org/data/2.5/RequestType?lat={lat}&lon={lon}&appid={API key}
-  //http://environment.data.gov.uk/flood-monitoring/id/measures/3400TH-flow-water-i-15_min-m3_s
-  
-  String uri = "https://api.octopus.energy/v1/products/AGILE-FLEX-22-11-25/electricity-tariffs/E-1R-AGILE-FLEX-22-11-25-J/standard-unit-rates/";
 
   octopusAPI.begin(newuri.c_str()); //http.begin(uri,test_root_ca); //HTTPS example connection
   int httpCode = octopusAPI.GET();
-  Serial.println("http code : " + String(httpCode));
+  Serial.println("http response code from Octopus : " + String(httpCode));
   if (httpCode == HTTP_CODE_OK) {
     if (!DecodeOctpusAgileRate(octopusAPI.getStream())) return false;
     client.stop();
@@ -392,6 +493,11 @@ bool obtainOctpusAgileRate(WiFiClient & client, String & theLocation) {
   octopusAPI.end();
   return true;
 }
+
+
+//Here start the Home assistant part
+
+
 
 //##-____###___#_#_#_#_#_#_#_#
 
@@ -437,21 +543,116 @@ void DisplayWeather() {                          // 4.7" e-paper display is 960x
   DisplayGeneralInfoSection();                   // Top line of the display
   //DisplayAstronomySection(5, 252);               // Astronomy section Sun rise/set, Moon phase and Moon icon
   DisplayMainWeatherSection(375, 178);           // Centre section of display for Location, temperature, Weather report, current Wx Symbol
-  DisplayWeatherIcon(188, 356);                  // Display weather icon scale = Large;
-  DisplayForecastSection(400, 0);              // 3hr forecast boxes
+  //DisplayWeatherIcon(188, 356);                  // Display weather icon scale = Large;
+  DisplayWeatherIcon(435, 66);                  // Display weather icon scale = Large;
+  DisplayForecastSection(494, 0);              // 3hr forecast boxes
   DisplayGraphAgileTariff(410, 310);
+  //DisplayGraphSection(320, 220);                 // Graphs of pressure, temperature, humidity and rain or snowfall
+  DisplayGoogleTaskItems(47,249);
+}
+
+String truncateSummary(const String& summary, float charLimit) {
+
+  float charCount = 0;
+  //int byteCount = 0;  // Tracks the total byte count
+  int charIndex = 0;  // Tracks the index in the string
+
+  // Iterate over each character to determine byte size
+  while (charIndex < summary.length()) {
+    unsigned char c = summary[charIndex];
+    int charByteSize = 1;
+
+    // Determine byte size based on UTF-8 character encoding
+    if (c <= 0x7F) {
+      charByteSize = 1;  // 1-byte character (ASCII)
+      charCount += 1.3;
+    } else if ((c & 0xE0) == 0xC0) {
+      charByteSize = 2;  // 2-byte character
+      charCount += 2;
+    } else if ((c & 0xF0) == 0xE0) {
+      charByteSize = 3;  // 3-byte character (Chinese, Japanese, Korean)
+      charCount += 2;      
+    } else if ((c & 0xF8) == 0xF0) {
+      charByteSize = 4;  // 4-byte character (rare, usually emojis)
+      charCount += 2;
+    }
+
+    // Check if adding this character would exceed the byte limit
+    // if (byteCount + charByteSize > byteLimit) {
+    //   break;
+    // }
+    if ( charCount > charLimit ){
+      break;
+    }
+
+    // Increment byte count and move to the next character
+   //byteCount += charByteSize;
+    charIndex += charByteSize;
+  }
+
+  // Return truncated string up to the calculated byte limit
+  return summary.substring(0, charIndex);
+}
+
+// Function to check if the due date has passed
+bool isDatePassed(const String& dueDate) {
+  int dueYear = dueDate.substring(0, 4).toInt();
+  int dueMonth = dueDate.substring(5, 7).toInt();
+  int dueDay = dueDate.substring(8, 10).toInt();
+
+
+  int currentYear = Date_str.substring(0, 4).toInt();
+  int currentMonth = Date_str.substring(5, 7).toInt();
+  int currentDay = Date_str.substring(8, 10).toInt();
+
+  // Compare years, months, and days to determine if due date is in the past
+  if (dueYear < currentYear) return true;
+  if (dueYear == currentYear && dueMonth < currentMonth) return true;
+  if (dueYear == currentYear && dueMonth == currentMonth && dueDay < currentDay) return true;
+  
+  return false;
+}
+
+void DisplayGoogleTaskItems(int x, int y ) {
+  int chineseFontSize = 20;
+  int yPos = y;
+  String notDue = "[]";
+  String showDue = "©";
+
+  for ( int i = 0; i < savedItemCount && i < MAX_TASKS; i++ ) {
+    setFont(chinese20);
+    String truncatedSummary = truncateSummary(googleTaskItems[i].summary, 20);
+    Serial.println("truncated to :"+truncatedSummary);
+    drawString(x, yPos, truncatedSummary, LEFT);
+    yPos += 39;
+    setFont(OpenSans8B);
+    String dueText = googleTaskItems[i].due;
+    if (isDatePassed(dueText)) {
+      dueText = showDue + " " + dueText;  // Add clock icon if due date has passed
+    } else {
+      dueText = notDue + " " + dueText;
+    }
+    drawString(x, yPos, dueText, LEFT);
+    yPos += 17;
+    if (yPos >= SCREEN_HEIGHT - 50) {
+      break;
+    }
+  }
 }
 
 void DisplayGeneralInfoSection() {
   setFont(OpenSans8B);
   drawString(345, 495, City, RIGHT);
+  drawString(340, 30, Date_str, RIGHT);
   //display time
   setFont(digital7);
   drawString(21, 72, Time_str, LEFT);
 }
 
 void DisplayWeatherIcon(int x, int y) {
-  DisplayConditionsSection(x, y, WxConditions[0].Icon, LargeIcon);
+  DisplayConditionsSection(x, y, WxConditions[0].Icon, SmallIcon);
+  setFont(OpenSans8B);
+  drawString(x + 5, y - 39, "Now", CENTER);
 }
 
 void DisplayMainWeatherSection(int x, int y) {
@@ -461,8 +662,6 @@ void DisplayMainWeatherSection(int x, int y) {
   //DisplayVisiCCoverUVISection(x - 10, y + 95);
 }
 
-
-
 void DisplayTempHumiPressSection(int x, int y) {
   setFont(inverted);
   fillRect( x , y, 113, 65, Black);
@@ -471,6 +670,14 @@ void DisplayTempHumiPressSection(int x, int y) {
   drawString(x + 110, y - 10 , String(WxConditions[0].Temperature, 1), RIGHT);
   drawString(x + 80 + 30 + 195, y -10 , String(WxConditions[0].Humidity, 0), RIGHT);
   drawString(x + 80 + 32 + 365, y -10 , String(WxConditions[0].WaterFloat, 0), RIGHT);
+  /*
+  DrawPressureAndTrend(x + 195, y + 15, WxConditions[0].Pressure, WxConditions[0].Trend);
+  int Yoffset = 42;
+  if (WxConditions[0].Windspeed > 0) {
+    drawString(x - 30, y + Yoffset, String(WxConditions[0].FeelsLike, 1) + "° FL", LEFT);   // Show FeelsLike temperature if windspeed > 0
+    Yoffset += 30;
+  }
+  */
   setFont(agency25);
   drawString(920, y + 75, String(WxConditions[0].High, 0) + "° | " + String(WxConditions[0].Low, 0) + "° Hi/Lo", RIGHT); // Show forecast high and Low
 }
@@ -515,7 +722,7 @@ void DisplayForecastSection(int x, int y) {
   do {
     DisplayForecastWeather(x, y, f, 75); // x,y cordinates, forecatsr number, spacing width (82)
     f++;
-  } while (f < 7);
+  } while (f < 6);
 }
 
 void DisplayGraphAgileTariff(int x, int y) {
@@ -563,6 +770,21 @@ void DrawSegment(int x, int y, int o1, int o2, int o3, int o4, int o11, int o12,
   drawLine(x + o11, y + o12, x + o13, y + o14, Black);
 }
 
+void DrawPressureAndTrend(int x, int y, float pressure, String slope) {
+  drawString(x + 25, y - 10, String(pressure, (Units == "M" ? 0 : 1)) + (Units == "M" ? "hPa" : "in"), LEFT);
+  if      (slope == "+") {
+    DrawSegment(x, y, 0, 0, 8, -8, 8, -8, 16, 0);
+    DrawSegment(x - 1, y, 0, 0, 8, -8, 8, -8, 16, 0);
+  }
+  else if (slope == "0") {
+    DrawSegment(x, y, 8, -8, 16, 0, 8, 8, 16, 0);
+    DrawSegment(x - 1, y, 8, -8, 16, 0, 8, 8, 16, 0);
+  }
+  else if (slope == "-") {
+    DrawSegment(x, y, 0, 0, 8, 8, 8, 8, 16, 0);
+    DrawSegment(x - 1, y, 0, 0, 8, 8, 8, 8, 16, 0);
+  }
+}
 
 void DisplayStatusSection(int x, int y, int rssi) {
   setFont(OpenSans8B);
@@ -831,7 +1053,7 @@ void addmoon(int x, int y, bool IconSize) {
 }
 
 void Nodata(int x, int y, bool IconSize, String IconName) {
-  if (IconSize == LargeIcon) setFont(OpenSans24B); else setFont(OpenSans12B);
+  if (IconSize == LargeIcon) setFont(chinese20); else setFont(OpenSans12B);
   drawString(x - 3, y - 10, "?", CENTER);
 }
 
@@ -857,6 +1079,11 @@ void DrawBaseImage() {
     If called with Y!_Max value of 500 and the data never goes above 500, then autoscale will retain a 0-500 Y scale, if on, the scale increases/decreases to match the data.
     auto_scale_margin, e.g. if set to 1000 then autoscale increments the scale by 1000 steps.
 */
+
+int toggle(int value) {
+  return value == 0 ? 1 : 0;
+}
+
 void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float Y1Max, String title, float DataArray[], int readings, boolean auto_scale, boolean barchart_mode) {
 #define auto_scale_margin 0 // Sets the autoscale increment, so axis steps up fter a change of e.g. 3
 #define y_minor_axis 5      // 5 y-axis division markers
@@ -865,8 +1092,15 @@ void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float
   int maxYscale = -10000;
   int minYscale =  10000;
   int last_x, last_y;
+  int pmShift;
   float x2, y2, barWidth, minus2zero, moveup;
+  String IsAMPM[2];
+  String xaxisLabel;
 
+  IsAMPM[0]="AM";
+  IsAMPM[1]="PM";
+
+ 
   for (int i = 1; i < readings; i++ ) {
       if (DataArray[i] >= maxYscale) maxYscale = DataArray[i];
       if (DataArray[i] <= minYscale) minYscale = DataArray[i];
@@ -878,6 +1112,8 @@ void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float
     if (minYscale != 0) minYscale = round(minYscale - auto_scale_margin); // Auto scale the graph and round to the nearest value defined, default was Y1Min
     Y1Min = round(minYscale);
   }
+ 
+
   // Draw the graph
   last_x = x_pos + 1;
   last_y = y_pos + (Y1Max - constrain(DataArray[1], Y1Min, Y1Max)) / (Y1Max - Y1Min) * gheight;
@@ -887,45 +1123,29 @@ void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float
   //setFont(OpenSans8B);
   bool firstHalf = true;
 
+  pmShift = ( CurrentHour >= 12) ? 12 : 0;
+
   for (int gx = 0; gx < readings; gx++) {
     moveup = ( DataArray[gx] >= 0 ) ? 10 : 0;
     x2 = x_pos + gx * gwidth / (readings - 1) - 1 ; // max_readings is the global variable that sets the maximum data that can be plotted
     y2 = y_pos + (Y1Max - constrain(DataArray[gx], Y1Min, Y1Max)) / (Y1Max - Y1Min) * gheight + 1;
     //Serial.println("Drawing position = X: "+ String(x2) +" LastX: "+ String(x2) +" Y:" + String(y2));
-    
-    if (barchart_mode) {
-      //Serial.println("Current min "+ String(CurrentMin));
-      //Serial.println("Test current hr: " + String(CurrentHour) + " vs " + String(gx) + " and Show current min:" + String(CurrentMin) + ( CurrentHour == (gx/2) ? "True" : "False" ));
-      if ( firstHalf ) {
 
-        if ( ( CurrentMin < 30 ) && (CurrentHour == (gx/2)) ) {
-          drawString(x_pos + 5, y_pos + 5, "NOW:" + String(DataArray[gx]) + "p MAX:" + String(maxYscale) +"p", LEFT);
-          barWidth = (gwidth / readings) - 1;
-          arrow( last_x + barWidth, last_y - barWidth - 20, barWidth, 180, 20, 20);
-        }
-        /*
-        if (( CurrentMin < 30 ) && ( CurrentHour == (gx/2)) ) {
-          barWidth = (gwidth / readings) - 1;
-          Serial.println("drawing ^ for first half with bar widht : " + String(barWidth));
-          arrow( last_x + (barWidth/2), last_y - barWidth - 10, barWidth, 180, 20, 20);
-          //fillTriangle( last_x , last_y - barWidth - 5, last_x + barWidth, last_y - barWidth - 5, last_x + ( barWidth / 2 ), last_y - 5, Black );
-        }
-        */
-        fillRect( last_x + 4, y2, (gwidth / readings) - 1, y_pos + gheight - y2 + 2 - moveup, Black);
-        fillRect( last_x + 6, y2+2, (gwidth / readings) - 1 -3, y_pos + gheight - y2  - moveup, White);
-        firstHalf = false;
-      } else {
-        if ( ( CurrentMin >= 30 ) && ( CurrentHour == (gx/2))) {
-          drawString(x_pos + 5, y_pos + 5, "NOW:" + String(DataArray[gx]) + "p MAX:" + String(maxYscale) +"p", LEFT);
-          barWidth = (gwidth / readings) - 1;
-          //Serial.println("drawing ^ for first half with bar widht : " + String(barWidth));
-          arrow( last_x, last_y - barWidth - 20, barWidth, 180, 20, 20);
-        }
-        fillRect(last_x, y2, (gwidth / readings) - 1, y_pos + gheight - y2 + 2  - moveup, Black);
-        firstHalf = true;
+    //ChatGPT optimized code
+    if (barchart_mode) {
+      barWidth = (gwidth / readings) - 1;
+      if (firstHalf && CurrentMin < 30 && (CurrentHour - pmShift ) == (gx / 2)) {
+          drawString(x_pos + 5, y_pos + 5, "NOW:" + String(DataArray[gx]) + "p MAX:" + String(maxYscale) + "p", LEFT);
+          arrow(last_x + barWidth, last_y - barWidth - 20, barWidth, 180, 20, 20);
+      } else if (!firstHalf && CurrentMin >= 30 && (CurrentHour - pmShift) == (gx / 2)) {
+          drawString(x_pos + 5, y_pos + 5, "NOW:" + String(DataArray[gx]) + "p MAX:" + String(maxYscale) + "p", LEFT);
+          arrow(last_x, last_y - barWidth - 20, barWidth, 180, 20, 20);
       }
+      fillRect(last_x + (firstHalf ? 4 : 0), y2, barWidth, y_pos + gheight - y2 + 2 - moveup, Black);
+      if (firstHalf) fillRect(last_x + 6, y2 + 2, barWidth - 3, y_pos + gheight - y2 - moveup, White);
+      firstHalf = !firstHalf;
     } else {
-      drawLine(last_x, last_y - 1, x2, y2 - 1, Black); // Two lines for hi-res display
+      drawLine(last_x, last_y - 1, x2, y2 - 1, Black);
       drawLine(last_x, last_y, x2, y2, Black);
     }
     last_x = x2;
@@ -938,7 +1158,7 @@ void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float
     for (int j = 0; j < number_of_dashes; j++) { // Draw dashed graph grid lines
       if (spacing < y_minor_axis) drawFastHLine((x_pos + 3 + j * gwidth / number_of_dashes), y_pos + (gheight * spacing / y_minor_axis), gwidth / (2 * number_of_dashes), Grey);
     }
-    if ((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing) < 5 || title == "Pressure_Trend") {
+    if ((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing) < 5 || title == TXT_PRESSURE_IN) {
       drawString(x_pos - 10, y_pos + gheight * spacing / y_minor_axis - 5, String((Y1Max - (float)(Y1Max - Y1Min) / y_minor_axis * spacing + 0.01), 1), RIGHT);
     }
     else
@@ -951,12 +1171,22 @@ void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float
       }
     }
   }
+
   for (int i = 1; i < 7; i++) {
     if ( i > 3) {
-      drawString(x_pos + gwidth / 6 * i, y_pos + gheight + 10, String( (i * 4) - 12 ) + "PM", CENTER);
+      if ( i == 6 ) {
+        xaxisLabel = "12" + IsAMPM[ pmShift / 12 ]; // draw PM
+      } else {
+        xaxisLabel = String( (i * 4) - 12 ) + IsAMPM[ toggle(pmShift / 12) ]; // draw PM
+      }
     } else {
-      drawString(x_pos + gwidth / 6 * i, y_pos + gheight + 10, String(i * 4) + "AM", CENTER);
-    }  
+      if ( i == 3 ) {
+        xaxisLabel = "12" + IsAMPM[ toggle(pmShift / 12) ]; // draw PM
+      } else {
+        xaxisLabel = String(i * 4) + IsAMPM[ pmShift / 12 ]; // draw AM
+      }
+    }
+    drawString(x_pos + gwidth / 6 * i, y_pos + gheight + 10, xaxisLabel, CENTER);   
     //if (i < 2) drawFastVLine(x_pos + gwidth / 3 * i + gwidth / 3, y_pos, gheight, LightGrey);
   }
 }
@@ -1018,5 +1248,5 @@ void edp_update() {
   epd_draw_grayscale_image(epd_full_screen(), framebuffer); // Update the screen
 }
 /*
-   1019 lines of code 18-10-2024
+   1071 lines of code 03-03-2021
 */
